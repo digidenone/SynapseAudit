@@ -1,0 +1,70 @@
+name: 'SynapseAudit Security Scanner'
+description: 'AI-Powered Security Scanning for your Codebase and Infrastructure'
+author: 'Digidenone'
+branding:
+  icon: 'shield'
+  color: 'green'
+inputs:
+  api-key:
+    description: 'SynapseAudit API Key (Optional for basic scans)'
+    required: false
+  target:
+    description: 'Target to scan (file path for static, URL/IP for cortex)'
+    required: false
+    default: '.'
+  scan-type:
+    description: 'Type of scan: static, web-scan, network-scan, cloud-scan, binary-scan, osint-scan, ai-scan, sca, secrets, iac, license'
+    required: false
+    default: 'static'
+  fail-on-critical:
+    description: 'Fail the workflow if critical vulnerabilities are found'
+    required: false
+    default: 'true'
+  auto-fix:
+    description: 'Automatically fix vulnerabilities and commit changes'
+    required: false
+    default: 'false'
+  config-url:
+    description: 'URL to a remote .synapseaudit.json configuration file'
+    required: false
+  delta-scan:
+    description: 'Scan only changed files (requires fetch-depth: 0)'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'GitHub Token for PR comments and commits'
+    required: false
+    default: '${{ github.token }}'
+  baseline-file:
+    description: 'Path to baseline file for suppressing known findings'
+    required: false
+    default: '.synapseaudit-baseline.json'
+  slack-webhook:
+    description: 'Slack Incoming Webhook URL for notifications'
+    required: false
+  upload-sbom:
+    description: 'Upload generated SBOM as a workflow artifact'
+    required: false
+    default: 'false'
+outputs:
+  vulnerability-count:
+    description: 'Total number of vulnerabilities found'
+  critical-count:
+    description: 'Number of critical severity vulnerabilities'
+  high-count:
+    description: 'Number of high severity vulnerabilities'
+  scan-duration:
+    description: 'Scan duration in seconds'
+  sarif-file:
+    description: 'Path to generated SARIF file (if vulnerabilities found)'
+  scan-results:
+    description: 'JSON string of full scan results'
+  security-score:
+    description: 'Security score (A-F grade)'
+  sbom-file:
+    description: 'Path to generated SBOM file'
+  license-report:
+    description: 'JSON string of license compliance results'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

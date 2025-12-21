@@ -1,0 +1,23 @@
+{
+    "name": "synapse-audit-action",
+    "version": "3.0.0",
+    "description": "GitHub Action for SynapseAudit",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+        "security",
+        "sast",
+        "synapseaudit"
+    ],
+    "author": "Digidenone",
+    "license": "MIT",
+    "dependencies": {
+        "@actions/artifact": "^5.0.1",
+        "@actions/cache": "^5.0.1",
+        "@actions/core": "^1.10.1",
+        "@actions/github": "^6.0.1",
+        "node-fetch": "^3.3.2"
+    }
+}
