@@ -82,41 +82,63 @@ async function run() {
         }
 
         // === Build Scan Command ===
-        let cmd = 'npx synapse-audit';
-        if (['sca', 'secrets', 'iac', 'sbom', 'license'].includes(scanType)) {
-            cmd += ` security ${scanType} "${finalTarget}" --output json`;
-        } else if (scanType.includes('-scan')) {
-            cmd += ` ${scanType} "${finalTarget}"`;
-        } else {
-            cmd += ` analyze "${finalTarget}" --output json`;
-        }
+        // If scanType is 'all' or 'comprehensive', run multiple scans
+        const scanTypes = scanType === 'all' || scanType === 'comprehensive' 
+            ? ['static', 'sca', 'secrets', 'iac', 'license'] 
+            : [scanType];
+        
+        let allVulnerabilities = [];
+        let allLicenses = [];
+        let sbomData = null;
 
-        // === 4. Auto-Remediation ===
-        if (autoFix && githubToken) {
-            core.startGroup('Running Auto-Remediation');
-            try {
-                execSync(`npx synapse-audit fix "${finalTarget}" --yes`, { stdio: 'inherit' });
-                await commitChanges();
-            } catch (e) {
-                core.warning(`Auto-fix failed: ${e.message}`);
+        // === Run All Scans ===
+        for (const currentScanType of scanTypes) {
+            core.startGroup(`Running ${currentScanType.toUpperCase()} Scan`);
+            
+            let cmd = 'npx synapse-audit';
+            if (['sca', 'secrets', 'iac', 'sbom', 'license'].includes(currentScanType)) {
+                cmd += ` security ${currentScanType} "${finalTarget}" --output json`;
+            } else if (currentScanType.includes('-scan')) {
+                cmd += ` ${currentScanType} "${finalTarget}"`;
+            } else {
+                cmd += ` analyze "${finalTarget}" --output json`;
             }
+            
+            core.info(`Executing: ${cmd}`);
+            let output = '';
+            try {
+                output = execSync(cmd, { encoding: 'utf-8', timeout: 300000, maxBuffer: 10 * 1024 * 1024 });
+            } catch (cmdError) {
+                output = cmdError.stdout || cmdError.stderr || '';
+            }
+            
+            // Parse and aggregate results
+            try {
+                const parsed = JSON.parse(output);
+                if (parsed.vulnerabilities) {
+                    allVulnerabilities.push(...parsed.vulnerabilities.map(v => ({ ...v, scanType: currentScanType })));
+                }
+                if (parsed.licenses) {
+                    allLicenses.push(...parsed.licenses);
+                }
+                if (parsed.sbom) {
+                    sbomData = parsed.sbom;
+                }
+            } catch (e) {
+                core.warning(`${currentScanType} scan returned non-JSON output`);
+            }
+            
             core.endGroup();
         }
-
-        // === Run Scan ===
-        core.startGroup('Running Security Scan');
-        core.info(`Executing: ${cmd}`);
-        let output = '';
-        try {
-            output = execSync(cmd, { encoding: 'utf-8', timeout: 300000, maxBuffer: 10 * 1024 * 1024 });
-        } catch (cmdError) {
-            output = cmdError.stdout || cmdError.stderr || '';
+        
+        // Run fallback secrets scan if no vulnerabilities found
+        if (allVulnerabilities.length === 0) {
+            core.info('Running fallback secrets scan...');
+            allVulnerabilities = runFallbackSecretsScan(finalTarget);
         }
-        core.endGroup();
 
-        // === Parse Results ===
-        let results = { vulnerabilities: [], licenses: [], sbom: null };
-        try { results = JSON.parse(output); } catch (e) {}
+        // === Aggregate Results ===
+        let results = { vulnerabilities: allVulnerabilities, licenses: allLicenses, sbom: sbomData };
 
         // === 5. Baseline Suppression ===
         const baselineIds = new Set(baseline.map(b => `${b.type}:${b.file}:${b.line}`));
@@ -156,16 +178,19 @@ async function run() {
             }
         });
 
-        // === 8. Direct PR Comment ===
-        if (githubToken && vulnCount > 0 && github.context.payload.pull_request) {
+        // === 8. Direct PR Comment (Always) ===
+        if (githubToken && github.context.payload.pull_request) {
             await postPRComment(githubToken, filteredVulns, score);
         }
 
-        // === 9. Generate SARIF ===
-        if (vulnCount > 0) {
-            const sarif = generateSARIF(filteredVulns, target);
-            fs.writeFileSync('synapse-results.sarif', JSON.stringify(sarif, null, 2));
-            core.setOutput('sarif-file', 'synapse-results.sarif');
+        // === 9. Generate and Upload SARIF ===
+        const sarif = generateSARIF(filteredVulns, target);
+        fs.writeFileSync('synapse-results.sarif', JSON.stringify(sarif, null, 2));
+        core.setOutput('sarif-file', 'synapse-results.sarif');
+        
+        // Upload SARIF to GitHub Code Scanning
+        if (githubToken) {
+            await uploadSarifToCodeScanning(githubToken, 'synapse-results.sarif');
         }
 
         // === 10. SBOM Upload ===
@@ -268,16 +293,25 @@ async function postPRComment(token, vulns, score) {
     const octokit = github.getOctokit(token);
     const context = github.context;
     
-    let body = `### SynapseAudit Security Report\n\n`;
-    body += `**Score: ${score}** | Found **${vulns.length}** vulnerabilities.\n\n`;
-    body += `| Severity | Type | File | Line |\n|---|---|---|---|\n`;
+    let body = `### 🛡️ SynapseAudit Security Report\n\n`;
+    body += `**Security Score: ${score}**\n\n`;
     
-    vulns.slice(0, 10).forEach(v => {
-        const icon = v.severity === 'critical' ? '🔴' : (v.severity === 'high' ? '🟠' : '⚪');
-        body += `| ${icon} ${v.severity} | ${v.type} | ${v.file} | ${v.line} |\n`;
-    });
+    if (vulns.length === 0) {
+        body += `✅ **No vulnerabilities detected!** Your code looks secure.\n\n`;
+        body += `_Keep up the great work! Regular scans help maintain security._`;
+    } else {
+        body += `Found **${vulns.length}** vulnerabilities:\n\n`;
+        body += `| Severity | Type | File | Line |\n|---|---|---|---|\n`;
+        
+        vulns.slice(0, 10).forEach(v => {
+            const icon = v.severity === 'critical' ? '🔴' : (v.severity === 'high' ? '🟠' : '⚪');
+            body += `| ${icon} ${v.severity} | ${v.type} | \`${v.file}\` | ${v.line} |\n`;
+        });
+        
+        if (vulns.length > 10) body += `\n*...and ${vulns.length - 10} more.*`;
+    }
     
-    if (vulns.length > 10) body += `\n*...and ${vulns.length - 10} more.*`;
+    body += `\n\n---\n_Scanned by [SynapseAudit](https://synapseaudit.digidenone.tech)_`;
 
     await octokit.rest.issues.createComment({
         ...context.repo,
@@ -322,10 +356,10 @@ async function sendSlackNotification(webhookUrl, vulnCount, criticalCount, score
 
 function generateSARIF(vulns, target) {
     return {
-        version: "3.0.0",
+        version: "2.1.0",
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         runs: [{
-            tool: { driver: { name: "SynapseAudit", version: "3.1.0" } },
+            tool: { driver: { name: "SynapseAudit", version: "3.1.0", rules: [] } },
             results: vulns.map((vuln, i) => ({
                 ruleId: vuln.cwe || `SYNAPSE-${i}`,
                 level: vuln.severity === 'critical' ? 'error' : 'warning',
@@ -336,4 +370,75 @@ function generateSARIF(vulns, target) {
     };
 }
 
+async function uploadSarifToCodeScanning(token, sarifPath) {
+    const octokit = github.getOctokit(token);
+    const context = github.context;
+    
+    try {
+        const sarifContent = fs.readFileSync(sarifPath, 'utf-8');
+        const gzipped = require('zlib').gzipSync(sarifContent);
+        const base64Sarif = gzipped.toString('base64');
+        
+        await octokit.rest.codeScanning.uploadSarif({
+            ...context.repo,
+            commit_sha: context.sha,
+            ref: context.ref,
+            sarif: base64Sarif
+        });
+        
+        core.info('SARIF uploaded to GitHub Code Scanning.');
+    } catch (error) {
+        core.warning(`SARIF upload failed: ${error.message}`);
+    }
+}
+
+function runFallbackSecretsScan(target) {
+    const vuln = [];
+    const secretPatterns = [
+        { name: 'AWS Access Key', regex: /AKIA[0-9A-Z]{16}/g },
+        { name: 'AWS Secret Key', regex: /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/g },
+        { name: 'Generic API Key', regex: /api[_-]?key['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_-]{20,}/gi },
+        { name: 'Private Key', regex: /-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g },
+        { name: 'GitHub Token', regex: /gh[pousr]_[A-Za-z0-9_]{36,}/g },
+        { name: 'Slack Token', regex: /xox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*/g }
+    ];
+    
+    const walkDir = (dir) => {
+        try {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+                const filePath = path.join(dir, file);
+                const stat = fs.statSync(filePath);
+                if (stat.isDirectory() && !file.startsWith('.') && file !== 'node_modules') {
+                    walkDir(filePath);
+                } else if (stat.isFile() && stat.size < 1024 * 1024) {
+                    try {
+                        const content = fs.readFileSync(filePath, 'utf-8');
+                        const lines = content.split('\n');
+                        lines.forEach((line, idx) => {
+                            for (const pattern of secretPatterns) {
+                                if (pattern.regex.test(line)) {
+                                    vuln.push({
+                                        severity: 'high',
+                                        type: pattern.name,
+                                        description: `Potential ${pattern.name} detected`,
+                                        file: filePath.replace(/\\/g, '/'),
+                                        line: idx + 1
+                                    });
+                                    pattern.regex.lastIndex = 0;
+                                }
+                            }
+                        });
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+    };
+    
+    walkDir(target === '.' ? process.cwd() : target);
+    core.info(`Fallback scan found ${vuln.length} potential secrets.`);
+    return vuln;
+}
+
 run();
+
